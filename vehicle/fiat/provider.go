@@ -29,8 +29,14 @@ func NewProvider(api *API, vin, pin string, expiry, cache time.Duration) *Provid
 		locationG: util.Cached(func() (LocationResponse, error) {
 			return api.Location(vin)
 		}, cache),
-		action: func(action, cmd string) (ActionResponse, error) {
-			return api.Action(vin, pin, action, cmd)
+		action: func(action, cmd string) (res ActionResponse, err error) {
+			res, err = api.Action(vin, pin, action, cmd)
+			if pin != "" {
+				if se := new(request.StatusError); errors.As(err, &se) && se.StatusCode() == http.StatusForbidden {
+					res, err = api.Action(vin, "", action, cmd)
+				}
+			}
+			return res, err
 		},
 		expiry: expiry,
 	}
@@ -51,10 +57,6 @@ func (v *Provider) deepRefresh() error {
 	res, err := v.action("ev", "DEEPREFRESH")
 	if err == nil && res.ResponseStatus != "pending" {
 		err = fmt.Errorf("invalid response status: %s", res.ResponseStatus)
-	} else {
-		if se := new(request.StatusError); errors.As(err, &se) && se.StatusCode() == http.StatusForbidden {
-			err = nil
-		}
 	}
 	return err
 }
@@ -66,29 +68,42 @@ func (v *Provider) status(statusG func() (StatusResponse, error)) (StatusRespons
 	if err == nil {
 		// result expired?
 		if res.Timestamp.Add(v.expiry).Before(time.Now()) {
-			// start refresh
-			if v.refreshTime.IsZero() {
-				if err = v.deepRefresh(); err != nil {
-					return res, err
-				}
+			isPluggedIn := false
+			isCharging := false
+			if res.EvInfo != nil {
+				isPluggedIn = res.EvInfo.Battery.PlugInStatus
+				isCharging = res.EvInfo.Battery.ChargingStatus == "CHARGING"
+			}
 
-				v.refreshTime = time.Now()
+			if isPluggedIn || isCharging {
+				// Deep Refresh mit Pin
+				if v.refreshTime.IsZero() {
+					errRefresh := v.deepRefresh()
+					if errRefresh != nil {
+						// Wenn 403, dann ohne Pin versuchen
+						if se := new(request.StatusError); errors.As(errRefresh, &se) && se.StatusCode() == http.StatusForbidden {
+							// Deep Refresh ohne Pin
+							v.action = func(action, cmd string) (ActionResponse, error) {
+								return v.action(action, cmd)
+							}
+							errRefresh = v.deepRefresh()
+						}
+						return res, errRefresh
+					}
+					v.refreshTime = time.Now()
+					return res, api.ErrMustRetry
+				}
+				// wait for refresh
+				if time.Since(v.refreshTime) > refreshTimeout {
+					v.refreshTime = time.Time{}
+					return res, api.ErrTimeout
+				}
 				return res, api.ErrMustRetry
 			}
-
-			// wait for refresh
-			if time.Since(v.refreshTime) > refreshTimeout {
-				v.refreshTime = time.Time{}
-				return res, api.ErrTimeout
-			}
-
-			return res, api.ErrMustRetry
 		}
-
 		// refresh done
 		v.refreshTime = time.Time{}
 	}
-
 	return res, err
 }
 
